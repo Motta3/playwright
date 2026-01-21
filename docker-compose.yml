@@ -1,0 +1,46 @@
+services:
+  playwright-api:
+    build: .
+    image: playwright-api:latest
+    container_name: playwright-api
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - API_TOKEN=${API_TOKEN:-super_secret_token_123}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+    restart: unless-stopped
+    shm_size: "1g"
+    ipc: "host"
+    ulimits:
+      core: 0                # evita core dumps enormes
+      nofile:
+        soft: 4096
+        hard: 8192
+    mem_limit: 2g
+    mem_reservation: 1024m
+    cpus: '2.0'
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => {r.statusCode === 200 ? process.exit(0) : process.exit(1)})"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./temp:/app/temp
+    networks:
+      - playwright-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  playwright-net:
+    driver: bridge
+
+volumes:
+  temp:
