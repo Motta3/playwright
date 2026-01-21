@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/playwright:v1.56.1-jammy
 WORKDIR /app
 COPY package*.json ./
 # Se o lock não está sincronizado, troque para: npm install --omit=dev
-RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+RUN --mount=type=cache,target=/root/.npm npm install --omit=dev
 
 COPY . .
 
