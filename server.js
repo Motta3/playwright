@@ -9,6 +9,7 @@ const cors = require('cors');
 const { chromium } = require('playwright');
 const os = require('os');
 const http = require('http');
+const https = require('https');
 
 const fs = require('fs');
 const path = require('path');
@@ -78,6 +79,82 @@ function toBooleanLike(value, fallback = false) {
   }
   return fallback;
 }
+
+// -------- HTTP helpers for DSL (NOVO) ----------
+function shellQuote(str) {
+  const s = String(str);
+  // bash single-quote style: ' -> '\''
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+// Converte um objeto { url, method, headers, postData } em cURL (bash)
+function requestDataToCurl(reqData) {
+  if (!reqData || !reqData.url) throw new Error('requestDataToCurl: missing reqData');
+  const url = reqData.url;
+  const method = String(reqData.method || 'GET').toUpperCase();
+  const headers = reqData.headers || {};
+  const postData = reqData.postData || '';
+
+  // Remover headers que frequentemente atrapalham a reprodução
+  const drop = new Set(['content-length', 'host', 'connection']);
+
+  const headerFlags = Object.entries(headers)
+    .filter(([k, v]) => v != null && v !== '' && !drop.has(String(k).toLowerCase()))
+    .map(([k, v]) => `-H ${shellQuote(`${k}: ${v}`)}`)
+    .join(' ');
+
+  const dataFlag =
+    method === 'GET' || postData === ''
+      ? ''
+      : `--data-raw ${shellQuote(postData)}`;
+
+  const compressedFlag = headers['accept-encoding'] ? '--compressed' : '';
+
+  return `curl ${shellQuote(url)} -X ${method} ${headerFlags} ${dataFlag} ${compressedFlag}`
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function postJson(urlString, payload, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlString);
+    const body = Buffer.from(JSON.stringify(payload ?? {}), 'utf8');
+    const lib = u.protocol === 'http:' ? http : https;
+
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'http:' ? 80 : 443),
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': body.length,
+        },
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode,
+            headers: res.headers,
+            body: data,
+          })
+        );
+      }
+    );
+
+    req.on('error', reject);
+    req.setTimeout(Math.max(1000, toNumberOr(timeoutMs, 30000)), () => {
+      req.destroy(new Error('POST timeout'));
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
 
 // -------- Playwright: browser singleton ----------
 let browserPromise = null;
@@ -478,6 +555,7 @@ app.post('/api/actions', requireAuth, async (req, res) => {
     await page.goto(url, { waitUntil, timeout: timeoutN });
 
     const results = [];
+    const vars = Object.create(null);
     for (const step of actions) {
       const { type } = step || {};
       if (!type) throw new Error('Action missing "type"');
@@ -529,12 +607,106 @@ app.post('/api/actions', requireAuth, async (req, res) => {
           results.push({ type, ok: true });
           break;
         }
+
+        case 'waitForRequest': {
+          // Ex: { type:'waitForRequest', urlIncludesAny:['get_stream_logs','get_jetstream_logs'], method:'POST', saveAs:'logsReq' }
+          const includesAny = Array.isArray(step.urlIncludesAny)
+            ? step.urlIncludesAny
+            : (Array.isArray(step.cookieRequestUrlIncludesAny) ? step.cookieRequestUrlIncludesAny : null);
+
+          const includesAnyFinal = (includesAny && includesAny.length ? includesAny : []).filter(Boolean);
+          if (!includesAnyFinal.length) {
+            throw new Error('waitForRequest: missing "urlIncludesAny" (array) or "cookieRequestUrlIncludesAny" (array)');
+          }
+
+          const wantMethod = step.method ? String(step.method).toUpperCase() : null;
+
+          const timeoutMs = (() => {
+            const t = toNumberOr(step.timeout_ms, NaN);
+            if (Number.isFinite(t) && t >= 1) return t;
+            return stepTimeout;
+          })();
+
+          const req = await page.waitForRequest(
+            (r) => {
+              const u = r.url();
+              const okUrl = includesAnyFinal.some((part) => u.includes(part));
+              if (!okUrl) return false;
+              if (wantMethod && String(r.method()).toUpperCase() !== wantMethod) return false;
+              return true;
+            },
+            { timeout: timeoutMs }
+          );
+
+          const saveAs = step.saveAs || 'lastRequest';
+          const reqData = {
+            url: req.url(),
+            method: req.method(),
+            headers: req.headers(),
+            postData: req.postData() || '',
+          };
+          vars[saveAs] = reqData;
+
+          results.push({ type, ok: true, saveAs, matchedUrl: reqData.url });
+          break;
+        }
+        case 'requestToCurl': {
+          // Ex: { type:'requestToCurl', fromVar:'lastRequest', saveAs:'curlBash' }
+          const fromVar = step.fromVar || step.requestVar || 'lastRequest';
+          const reqData = vars[fromVar];
+          if (!reqData) throw new Error(`requestToCurl: vars["${fromVar}"] not found`);
+
+          const curl = requestDataToCurl(reqData);
+          const saveAs = step.saveAs || 'lastCurl';
+          vars[saveAs] = curl;
+
+          results.push({ type, ok: true, saveAs });
+          break;
+        }
+        case 'postWebhook': {
+          // Ex: { type:'postWebhook', url:'https://...', requestVar:'lastRequest', curlVar:'lastCurl', saveAs:'webhookResp' }
+          const url = step.url || step.webhookUrl;
+          if (!url) throw new Error('postWebhook: missing "url" (or "webhookUrl")');
+
+          const requestVar = step.requestVar || 'lastRequest';
+          const curlVar = step.curlVar || 'lastCurl';
+          const respVar = step.saveAs || 'lastWebhookResponse';
+
+          const reqData = vars[requestVar] || null;
+          const curl = vars[curlVar] || '';
+
+          // payload customizável; se não vier, cria um padrão compatível com teu webhook
+          const payload =
+            step.payload && typeof step.payload === 'object'
+              ? step.payload
+              : {
+                  captured_at: new Date().toISOString(),
+                  source: 'playwright_dsl',
+                  bubble_request_url: reqData?.url || null,
+                  bubble_request_method: reqData?.method || null,
+                  cookieHeader: (reqData?.headers?.cookie || '').trim(),
+                  curl_bash: String(curl || ''),
+                };
+
+          const timeoutMs = (() => {
+            const t = toNumberOr(step.timeout_ms, NaN);
+            if (Number.isFinite(t) && t >= 1) return t;
+            return stepTimeout;
+          })();
+
+          const resp = await postJson(String(url), payload, timeoutMs);
+          vars[respVar] = resp;
+
+          results.push({ type, ok: true, saveAs: respVar, status: resp.status });
+          break;
+        }
+
         default:
           throw new Error(`Unsupported action type: ${type}`);
       }
     }
 
-    return res.json({ ok: true, results });
+    return res.json({ ok: true, results, vars });
   } catch (err) {
     console.error('Erro no actions:', err);
     return res.status(500).json({ error: 'Failed to run actions', details: String(err?.message || err) });
